@@ -32,15 +32,17 @@ func main() {
 		Color:   *colors,
 	}
 
-	if *isClient {
-		logger.Info("discord-proxy (%s) connecting to %v", version, *serverAddr)
-	} else {
-		logger.Info("discord-proxy (%s) listening on %v", version, *serverAddr)
-	}
+	logger.Info("discord-proxy (%s)", version)
 	addr, err := net.ResolveTCPAddr("tcp", *serverAddr)
 	if err != nil {
 		logger.Warn("Failed to resolve server address: %s", err)
 		os.Exit(1)
+	}
+
+	if *isClient {
+		logger.Info("Forwarding to %v", addr)
+	} else {
+		logger.Info("Listening on %v", addr)
 	}
 
 	var listener net.Listener

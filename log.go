@@ -55,7 +55,7 @@ func (l ColorLogger) Debug(f string, args ...interface{}) {
 
 // Info - Log a general message
 func (l ColorLogger) Info(f string, args ...interface{}) {
-	l.output("green", f, args...)
+	l.output("", f, args...)
 }
 
 // Warn - Log a warning

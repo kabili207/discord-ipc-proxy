@@ -68,7 +68,7 @@ func (p *Proxy) Start() {
 	}
 
 	//display both ends
-	p.Log.Info("Opened %s >>> %s", p.addr.String(), p.isServer)
+	p.Log.Info("Opened %s >>> %v", p.addr.String(), p.isServer)
 
 	//bidirectional copy
 	go p.pipe(p.lconn, p.rconn)
