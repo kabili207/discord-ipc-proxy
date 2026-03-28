@@ -205,44 +205,76 @@ func runFlatpak(ctx context.Context, opts proxyOpts) error {
 	return nil
 }
 
-// startFlatpakListeners creates a Flatpak IPC listener and starts a filesystem
-// watcher for dynamically discovered Discord IPC sockets. Used by all modes
-// when --flatpak is enabled, and by the flatpak subcommand.
+// startFlatpakListeners manages the Flatpak IPC listener lifecycle based on
+// Discord's presence. The listener is created when Discord is detected and
+// torn down when Discord exits, so sandboxed apps see ENOENT instead of
+// connecting to a proxy that can't reach Discord.
 func startFlatpakListeners(ctx context.Context, wg *sync.WaitGroup, dialFn func() (net.Conn, error), opts proxyOpts) error {
-	listener, err := ipc.ListenFlatpak()
+	events, err := watcher.Watch(ctx)
 	if err != nil {
-		return fmt.Errorf("creating Flatpak IPC listener: %w", err)
+		return fmt.Errorf("starting watcher: %w", err)
 	}
-	slog.Info("Listening on Flatpak IPC path")
+
+	// Check if Discord is already running at startup.
+	discordPresent := false
+	if conn, err := ipc.DialDiscord(); err == nil {
+		conn.Close()
+		discordPresent = true
+	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		acceptLoop(ctx, listener, dialFn, opts)
-	}()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		onFound := func(path string) {
-			dialPath := func() (net.Conn, error) {
-				return ipc.DialDiscordPath(path)
+		var listener net.Listener
+		var listenerCancel context.CancelFunc
+
+		startListener := func() {
+			if listener != nil {
+				return // already running
 			}
-			fl, err := ipc.ListenFlatpak()
+			l, err := ipc.ListenFlatpak()
 			if err != nil {
-				slog.Warn("Failed to create listener for discovered socket", "path", path, "error", err)
+				slog.Warn("Failed to create Flatpak IPC listener", "error", err)
 				return
 			}
-			slog.Info("Created proxy for discovered socket", "path", path)
+			listener = l
+			slog.Info("Flatpak IPC listener started")
+
+			listenerCtx, cancel := context.WithCancel(ctx)
+			listenerCancel = cancel
+
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				acceptLoop(ctx, fl, dialPath, opts)
+				acceptLoop(listenerCtx, l, dialFn, opts)
 			}()
 		}
 
-		if err := watcher.Watch(ctx, onFound); err != nil && ctx.Err() == nil {
-			slog.Error("Watcher failed", "error", err)
+		stopListener := func() {
+			if listener == nil {
+				return // not running
+			}
+			slog.Info("Flatpak IPC listener stopped")
+			listenerCancel()
+			listener = nil
+			listenerCancel = nil
+		}
+
+		defer stopListener()
+
+		if discordPresent {
+			startListener()
+		} else {
+			slog.Info("Discord not detected, waiting for it to start")
+		}
+
+		for event := range events {
+			if event.Created {
+				startListener()
+			} else {
+				stopListener()
+			}
 		}
 	}()
 

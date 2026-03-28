@@ -6,14 +6,15 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync/atomic"
 )
 
 // Proxy manages a bidirectional connection, piping data between local and remote.
 type Proxy struct {
-	sentBytes     uint64
-	receivedBytes uint64
+	sentBytes     atomic.Uint64
+	receivedBytes atomic.Uint64
 	lconn, rconn  io.ReadWriteCloser
-	erred         bool
+	erred         atomic.Bool
 	errsig        chan bool
 	log           *slog.Logger
 	outputHex     bool
@@ -61,18 +62,17 @@ func (p *Proxy) Run() {
 	go p.pipe(p.rconn, p.lconn, "recv")
 
 	<-p.errsig
-	p.log.Info("Connection closed", "sent", p.sentBytes, "received", p.receivedBytes)
+	p.log.Info("Connection closed", "sent", p.sentBytes.Load(), "received", p.receivedBytes.Load())
 }
 
 func (p *Proxy) signalError(msg string, err error) {
-	if p.erred {
+	if !p.erred.CompareAndSwap(false, true) {
 		return
 	}
 	if err != io.EOF {
 		p.log.Warn(msg, "error", err)
 	}
 	p.errsig <- true
-	p.erred = true
 }
 
 func (p *Proxy) pipe(src, dst io.ReadWriter, direction string) {
@@ -80,7 +80,7 @@ func (p *Proxy) pipe(src, dst io.ReadWriter, direction string) {
 	buf := make([]byte, 0xffff)
 
 	for {
-		if p.erred {
+		if p.erred.Load() {
 			return
 		}
 		n, err := src.Read(buf)
@@ -102,9 +102,9 @@ func (p *Proxy) pipe(src, dst io.ReadWriter, direction string) {
 		}
 
 		if isSend {
-			p.sentBytes += uint64(n)
+			p.sentBytes.Add(uint64(n))
 		} else {
-			p.receivedBytes += uint64(n)
+			p.receivedBytes.Add(uint64(n))
 		}
 	}
 }

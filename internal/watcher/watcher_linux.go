@@ -13,14 +13,19 @@ import (
 
 var ipcSocketPattern = regexp.MustCompile(`discord-ipc-\d+$`)
 
-// Watch monitors directories for new Discord IPC sockets and calls onFound for each.
-// It blocks until the context is cancelled.
-func Watch(ctx context.Context, onFound func(path string)) error {
+// Event represents a Discord IPC socket appearing or disappearing.
+type Event struct {
+	Path    string
+	Created bool // true = created, false = removed
+}
+
+// Watch monitors directories for Discord IPC socket creation and removal.
+// Events are sent on the returned channel. Blocks until the context is cancelled.
+func Watch(ctx context.Context) (<-chan Event, error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer w.Close()
 
 	for _, dir := range ipc.WatchDirectories() {
 		if err := w.Add(dir); err != nil {
@@ -28,23 +33,38 @@ func Watch(ctx context.Context, onFound func(path string)) error {
 		}
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case event, ok := <-w.Events:
-			if !ok {
-				return nil
+	ch := make(chan Event, 4)
+
+	go func() {
+		defer w.Close()
+		defer close(ch)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-w.Events:
+				if !ok {
+					return
+				}
+				if !ipcSocketPattern.MatchString(event.Name) {
+					continue
+				}
+				if event.Has(fsnotify.Create) {
+					slog.Info("Discord IPC socket created", "path", event.Name)
+					ch <- Event{Path: event.Name, Created: true}
+				} else if event.Has(fsnotify.Remove) {
+					slog.Info("Discord IPC socket removed", "path", event.Name)
+					ch <- Event{Path: event.Name, Created: false}
+				}
+			case err, ok := <-w.Errors:
+				if !ok {
+					return
+				}
+				slog.Warn("Watcher error", "error", err)
 			}
-			if event.Has(fsnotify.Create) && ipcSocketPattern.MatchString(event.Name) {
-				slog.Info("Discovered Discord IPC socket", "path", event.Name)
-				onFound(event.Name)
-			}
-		case err, ok := <-w.Errors:
-			if !ok {
-				return nil
-			}
-			slog.Warn("Watcher error", "error", err)
 		}
-	}
+	}()
+
+	return ch, nil
 }
