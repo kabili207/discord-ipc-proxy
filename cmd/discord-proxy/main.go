@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	sloghelper "github.com/kabili207/slog-helper"
 
 	"github.com/kabili207/discord-proxy/internal/ipc"
+	"github.com/kabili207/discord-proxy/internal/protocol"
 	"github.com/kabili207/discord-proxy/internal/proxy"
 	"github.com/kabili207/discord-proxy/internal/watcher"
 )
@@ -78,6 +80,9 @@ type proxyOpts struct {
 	outputHex    bool
 }
 
+// connWrapper optionally transforms a net.Conn into a framed ReadWriteCloser.
+type connWrapper func(net.Conn, *slog.Logger) (io.ReadWriteCloser, error)
+
 var connID atomic.Uint64
 
 func nextConnLogger() *slog.Logger {
@@ -85,9 +90,16 @@ func nextConnLogger() *slog.Logger {
 	return slog.With("conn", id)
 }
 
-// acceptLoop accepts connections from a listener and proxies them using dialFn.
+// acceptLoopOpts configures an accept loop.
+type acceptLoopOpts struct {
+	proxyOpts
+	wrapLocal  connWrapper // applied to the accepted (local) connection
+	wrapRemote connWrapper // applied to the dialed (remote) connection
+}
+
+// acceptLoop accepts connections from a listener and proxies them.
 // Blocks until the context is cancelled.
-func acceptLoop(ctx context.Context, listener net.Listener, dialFn func() (net.Conn, error), opts proxyOpts) {
+func acceptLoop(ctx context.Context, listener net.Listener, dialFn func() (net.Conn, error), opts acceptLoopOpts) {
 	go func() {
 		<-ctx.Done()
 		listener.Close()
@@ -113,11 +125,94 @@ func acceptLoop(ctx context.Context, listener net.Listener, dialFn func() (net.C
 			continue
 		}
 
-		p := proxy.New(conn, rconn, log)
+		var local io.ReadWriteCloser = conn
+		var remote io.ReadWriteCloser = rconn
+
+		if opts.wrapLocal != nil {
+			local, err = opts.wrapLocal(conn, log)
+			if err != nil {
+				log.Warn("Local connection setup failed", "error", err)
+				conn.Close()
+				rconn.Close()
+				continue
+			}
+		}
+
+		if opts.wrapRemote != nil {
+			remote, err = opts.wrapRemote(rconn, log)
+			if err != nil {
+				log.Warn("Remote connection setup failed", "error", err)
+				local.Close()
+				rconn.Close()
+				continue
+			}
+		}
+
+		p := proxy.New(local, remote, log)
 		p.SetDisableNagle(opts.disableNagle)
 		p.SetOutputHex(opts.outputHex)
 		go p.Run()
 	}
+}
+
+// serverHandshake performs the server-side protocol handshake on a TCP connection.
+func serverHandshake(conn net.Conn, log *slog.Logger) (io.ReadWriteCloser, error) {
+	clientHS, err := protocol.ReadHandshake(conn)
+	if err != nil {
+		return nil, fmt.Errorf("reading client handshake: %w", err)
+	}
+	log.Info("Client connected",
+		"version", clientHS.Version,
+		"os", clientHS.OS,
+		"hostname", clientHS.Hostname,
+	)
+
+	discordAvailable := true
+	if testConn, err := ipc.DialDiscord(); err != nil {
+		discordAvailable = false
+	} else {
+		testConn.Close()
+	}
+
+	serverHS := protocol.LocalHandshake()
+	serverHS.DiscordAvailable = &discordAvailable
+	if err := protocol.WriteHandshake(conn, serverHS); err != nil {
+		return nil, fmt.Errorf("writing server handshake: %w", err)
+	}
+
+	fc := protocol.NewFramedConn(conn)
+	fc.OnControl = func(ctrl protocol.Control) {
+		log.Info("Control message from client", "status", ctrl.Status, "detail", ctrl.Detail)
+	}
+	return fc, nil
+}
+
+// clientHandshake performs the client-side protocol handshake on a TCP connection.
+func clientHandshake(conn net.Conn, log *slog.Logger) (io.ReadWriteCloser, error) {
+	clientHS := protocol.LocalHandshake()
+	if err := protocol.WriteHandshake(conn, clientHS); err != nil {
+		return nil, fmt.Errorf("writing client handshake: %w", err)
+	}
+
+	serverHS, err := protocol.ReadHandshake(conn)
+	if err != nil {
+		return nil, fmt.Errorf("reading server handshake: %w", err)
+	}
+	log.Info("Server connected",
+		"version", serverHS.Version,
+		"os", serverHS.OS,
+		"hostname", serverHS.Hostname,
+	)
+
+	if serverHS.DiscordAvailable != nil && !*serverHS.DiscordAvailable {
+		log.Warn("Server reports Discord is not available")
+	}
+
+	fc := protocol.NewFramedConn(conn)
+	fc.OnControl = func(ctrl protocol.Control) {
+		log.Info("Control message from server", "status", ctrl.Status, "detail", ctrl.Detail)
+	}
+	return fc, nil
 }
 
 // runServer listens on TCP and forwards each connection to Discord IPC.
@@ -136,10 +231,14 @@ func runServer(ctx context.Context, addr string, flatpak bool, opts proxyOpts) e
 
 	var wg sync.WaitGroup
 
+	// TCP side gets server handshake + framing; IPC side is raw.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		acceptLoop(ctx, listener, ipc.DialDiscord, opts)
+		acceptLoop(ctx, listener, ipc.DialDiscord, acceptLoopOpts{
+			proxyOpts: opts,
+			wrapLocal: serverHandshake,
+		})
 	}()
 
 	if flatpak {
@@ -174,14 +273,20 @@ func runClient(ctx context.Context, addr string, flatpak bool, opts proxyOpts) e
 
 	var wg sync.WaitGroup
 
+	// IPC side is raw; TCP (remote) side gets client handshake + framing.
+	loopOpts := acceptLoopOpts{
+		proxyOpts:  opts,
+		wrapRemote: clientHandshake,
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		acceptLoop(ctx, listener, dialTCP, opts)
+		acceptLoop(ctx, listener, dialTCP, loopOpts)
 	}()
 
 	if flatpak {
-		if err := startFlatpakListeners(ctx, &wg, dialTCP, opts); err != nil {
+		if err := startFlatpakListeners(ctx, &wg, dialTCP, opts, clientHandshake); err != nil {
 			return err
 		}
 	}
@@ -209,10 +314,23 @@ func runFlatpak(ctx context.Context, opts proxyOpts) error {
 // Discord's presence. The listener is created when Discord is detected and
 // torn down when Discord exits, so sandboxed apps see ENOENT instead of
 // connecting to a proxy that can't reach Discord.
-func startFlatpakListeners(ctx context.Context, wg *sync.WaitGroup, dialFn func() (net.Conn, error), opts proxyOpts) error {
+//
+// wrapRemote is optional — if provided, the dialed connection is wrapped with
+// framing (used when flatpak mode is combined with TCP client mode).
+func startFlatpakListeners(ctx context.Context, wg *sync.WaitGroup, dialFn func() (net.Conn, error), opts proxyOpts, wrapRemote ...connWrapper) error {
 	events, err := watcher.Watch(ctx)
 	if err != nil {
 		return fmt.Errorf("starting watcher: %w", err)
+	}
+
+	var remoteWrapper connWrapper
+	if len(wrapRemote) > 0 {
+		remoteWrapper = wrapRemote[0]
+	}
+
+	loopOpts := acceptLoopOpts{
+		proxyOpts:  opts,
+		wrapRemote: remoteWrapper,
 	}
 
 	// Check if Discord is already running at startup.
@@ -247,7 +365,7 @@ func startFlatpakListeners(ctx context.Context, wg *sync.WaitGroup, dialFn func(
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				acceptLoop(listenerCtx, l, dialFn, opts)
+				acceptLoop(listenerCtx, l, dialFn, loopOpts)
 			}()
 		}
 
