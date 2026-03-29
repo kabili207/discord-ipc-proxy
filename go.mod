@@ -4,7 +4,7 @@ go 1.25.3
 
 require (
 	github.com/fsnotify/fsnotify v1.7.0
-	github.com/kabili207/slog-helper v0.0.0
+	github.com/kabili207/slog-helper v0.1.0
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce
 )
 
@@ -16,5 +16,3 @@ require (
 	github.com/systemd/slog-journal v0.1.2 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 )
-
-replace github.com/kabili207/slog-helper => /home/kabili/Projects/Go/slog-helper
